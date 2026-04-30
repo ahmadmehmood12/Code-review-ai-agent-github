@@ -2,8 +2,11 @@ import os
 import json
 import subprocess
 from openai import OpenAI
+from dotenv import load_dotenv
 
+load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 
 MAX_FILE_SIZE = 5000  # characters per file (prevent token overflow)
 
