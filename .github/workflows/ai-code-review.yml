@@ -1,0 +1,79 @@
+name: AI Code Review (Production)
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install openai PyGithub
+
+      - name: Run AI Review
+        id: ai_review
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python scripts/ai_review.py
+
+      - name: Post Inline Comments
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const review = JSON.parse(fs.readFileSync('review_result.json', 'utf8'));
+
+            for (const issue of review.issues) {
+              await github.rest.pulls.createReviewComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+                body: issue.comment,
+                path: issue.file,
+                line: issue.line,
+                side: "RIGHT"
+              });
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `### AI Review Summary\n\n${review.summary}\n\nStatus: ${review.status}`
+            });
+
+      - name: Auto Approve PR
+        if: success()
+        uses: hmarr/auto-approve-action@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Save Approval Artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: approval-log
+          path: review_result.json
+
+      - name: Fail if Rejected
+        if: failure()
+        run: exit 1
