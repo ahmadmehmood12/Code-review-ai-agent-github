@@ -151,7 +151,7 @@ def main():
 
     prompt = build_prompt(code_map)
 
-    print("🤖 Sending to AI for review...")
+    print("🤖 Sending to AI forfewafwefweaf review...")
     result = review_code(prompt)
 
     save_result(result)
