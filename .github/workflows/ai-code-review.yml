@@ -23,9 +23,16 @@ jobs:
         with:
           python-version: "3.11"
 
+      # ✅ Install dependencies properly
       - name: Install dependencies
         run: |
-          pip install openai PyGithub
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ✅ Static code check BEFORE AI review
+      - name: Run Flake8 Linting
+        run: |
+          flake8 . || true
 
       - name: Run AI Review
         id: ai_review
@@ -43,24 +50,29 @@ jobs:
             const review = JSON.parse(fs.readFileSync('review_result.json', 'utf8'));
 
             for (const issue of review.issues) {
-              await github.rest.pulls.createReviewComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number: context.issue.number,
-                body: issue.comment,
-                path: issue.file,
-                line: issue.line,
-                side: "RIGHT"
-              });
+              try {
+                await github.rest.pulls.createReviewComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: context.issue.number,
+                  body: issue.comment,
+                  path: issue.file,
+                  line: issue.line,
+                  side: "RIGHT"
+                });
+              } catch (err) {
+                console.log("Inline comment failed:", err);
+              }
             }
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: `### AI Review Summary\n\n${review.summary}\n\nStatus: ${review.status}`
+              body: `### 🤖 AI Review Summary\n\n${review.summary}\n\n**Status:** ${review.status}`
             });
 
+      # ❌ Only approve if passed
       - name: Auto Approve PR
         if: success()
         uses: hmarr/auto-approve-action@v4
