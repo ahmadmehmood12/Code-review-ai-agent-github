@@ -20,7 +20,7 @@ jobs:
           git fetch origin main
           git diff origin/main...HEAD > diff.txt
 
-      - name: Call OpenAI API for review
+      - name: Call OpenAI API
         id: review
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -29,24 +29,22 @@ jobs:
             -s \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             -H "Content-Type: application/json" \
-            -d @- <<EOF
-          {
-            "model": "gpt-4.1-mini",
-            "messages": [
-              {
-                "role": "system",
-                "content": "You are a strict senior software engineer reviewing pull requests. Detect bad practices, unsafe dict access, missing error handling, and missing README.md."
-              },
-              {
-                "role": "user",
-                "content": "Review this PR diff and return PASS or FAIL with issues and fixes:\n\n$(cat diff.txt)"
-              }
-            ]
-          }
-          EOF
-          )
-
+            -d '{
+              "model": "gpt-4.1-mini",
+              "messages": [
+                {
+                  "role": "system",
+                  "content": "You are a strict senior code reviewer."
+                },
+                {
+                  "role": "user",
+                  "content": "Review this diff and find issues:\n\n'"$(cat diff.txt | sed 's/"/\\"/g')"'
+                }
+              ]
+            }')
+      
           echo "$RESPONSE" > result.json
+      
           echo "result<<EOF" >> $GITHUB_OUTPUT
           cat result.json >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
@@ -58,8 +56,15 @@ jobs:
         with:
           script: |
             const res = JSON.parse(process.env.RESULT);
+            
+            // 🛑 Handle API errors safely
+            if (!res.choices || !res.choices[0]) {
+              core.setFailed("OpenAI API failed:\n" + JSON.stringify(res, null, 2));
+              return;
+            }
+            
             const text = res.choices[0].message.content;
-
+            
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
