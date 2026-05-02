@@ -17,9 +17,8 @@ jobs:
     if: github.base_ref == 'main'
 
     steps:
-      # ─────────────────────────────────────────────
-      # STEP 1 — Checkout & fetch PR diff
-      # ─────────────────────────────────────────────
+
+      # ── STEP 1: Checkout and fetch PR diff ──────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -33,32 +32,30 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          git diff $BASE_SHA...$HEAD_SHA > /tmp/pr_diff.txt
-          DIFF_CONTENT=$(cat /tmp/pr_diff.txt | head -c 28000)
-          echo "diff_length=$(wc -l < /tmp/pr_diff.txt)" >> $GITHUB_OUTPUT
+          git diff "$BASE_SHA...$HEAD_SHA" > /tmp/pr_diff.txt
+          head -c 28000 /tmp/pr_diff.txt > /tmp/diff_trimmed.txt
+          echo "diff_length=$(wc -l < /tmp/pr_diff.txt)" >> "$GITHUB_OUTPUT"
 
-          CHANGED_FILES=$(git diff --name-only $BASE_SHA...$HEAD_SHA)
-          echo "changed_files<<EOF" >> $GITHUB_OUTPUT
-          echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          CHANGED_FILES=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+          {
+            echo "changed_files<<EOF"
+            echo "$CHANGED_FILES"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
-          printf '%s' "$DIFF_CONTENT" > /tmp/diff_trimmed.txt
+          PR_AUTHOR=$(gh pr view "$PR_NUMBER" --json author --jq '.author.login')
+          echo "pr_author=$PR_AUTHOR" >> "$GITHUB_OUTPUT"
 
-          PR_AUTHOR=$(gh pr view $PR_NUMBER --json author --jq '.author.login')
-          echo "pr_author=$PR_AUTHOR" >> $GITHUB_OUTPUT
-
-      # ─────────────────────────────────────────────
-      # STEP 2 — README guard
-      # ─────────────────────────────────────────────
+      # ── STEP 2: README guard ─────────────────────────────────────────────
       - name: Check for README.md in PR
         id: readme_check
         env:
           CHANGED_FILES: ${{ steps.pr_data.outputs.changed_files }}
         run: |
           if echo "$CHANGED_FILES" | grep -qi "README.md"; then
-            echo "readme_present=true" >> $GITHUB_OUTPUT
+            echo "readme_present=true" >> "$GITHUB_OUTPUT"
           else
-            echo "readme_present=false" >> $GITHUB_OUTPUT
+            echo "readme_present=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Post README missing comment
@@ -68,129 +65,109 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ steps.pr_data.outputs.pr_author }}
         run: |
-          gh pr comment $PR_NUMBER --body "## ❌ Missing README
+          gh pr comment "$PR_NUMBER" --body "Missing README: This PR does not include a README.md update. Please add or update README.md before this can be merged."
 
-          @$PR_AUTHOR — This PR does not include a \`README.md\` update.
-
-          **Why this matters:** Every PR touching source code should document the change, new setup steps, or updated usage.
-
-          Please add or update \`README.md\` before this can be merged."
-
-      # ─────────────────────────────────────────────
-      # STEP 3 — AI code review via OpenAI API (GPT-4o)
-      #          Uses OPENAI_API_KEY from repository secrets
-      # ─────────────────────────────────────────────
-      - name: Run AI review
-        id: ai_review
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      # ── STEP 3: Write and run AI review script ───────────────────────────
+      - name: Write AI review script
         run: |
-          python3 - <<'PYEOF'
+          cat > /tmp/run_review.py << 'PYEOF'
           import json, os, urllib.request
-
+          
           diff = open("/tmp/diff_trimmed.txt").read()
-
-          SYSTEM_PROMPT = """You are a senior software engineer conducting a strict code review.
-You MUST respond with a single valid JSON object only — no markdown fences,
-no explanation, no text outside the JSON."""
-
-          USER_PROMPT = f"""Analyze the following git diff and identify issues.
-
-Respond in this exact JSON shape:
-{{
-  "summary": "One sentence overall assessment.",
-  "verdict": "PASS or FAIL",
-  "issues": [
-    {{
-      "file": "path/to/file.py",
-      "line": 42,
-      "severity": "CRITICAL or WARNING or SUGGESTION",
-      "title": "Short issue name",
-      "description": "What is wrong and why it is a problem.",
-      "fix": "Concrete suggested fix or code snippet."
-    }}
-  ]
-}}
-
-Rules:
-- verdict is FAIL if ANY issue has severity CRITICAL.
-- verdict is PASS only if there are zero CRITICAL issues.
-
-Detect CRITICAL issues:
-  * Bare `except Exception` or bare `except:` without specific exception types
-  * Direct dict access d["key"] where .get("key") should be used
-  * Missing try/except around risky I/O, DB calls, or network requests
-  * Unhandled None that will cause AttributeError at runtime
-  * Credentials, tokens, or API keys hardcoded in source
-
-Detect WARNING issues:
-  * Python functions missing type hints on parameters or return type
-  * Functions longer than 40 lines with no decomposition
-  * Deeply nested conditionals (3+ levels) without early returns
-  * Mutable default arguments (def f(x=[]))
-  * Poor variable names (single letters outside loops)
-
-Detect SUGGESTION issues:
-  * Missing docstrings on public functions or classes
-  * Repeated code blocks that could be extracted
-  * Logging statements without log levels
-
-- If the diff has no Python, skip Python-specific checks but still check for
-  hardcoded secrets, broad exception patterns in other languages, and readability.
-- line must be the actual line number from the diff where the issue starts.
-- Do not invent issues. Only report what is visible in the diff.
-
-GIT DIFF:
-{diff}
-"""
-
-          payload = {
-            "model": "gpt-4o",
-            "temperature": 0,
-            "response_format": {"type": "json_object"},
-            "messages": [
-              {"role": "system", "content": SYSTEM_PROMPT},
-              {"role": "user",   "content": USER_PROMPT}
-            ]
-          }
-
-          req = urllib.request.Request(
-            "https://api.openai.com/v1/chat/completions",
-            data=json.dumps(payload).encode(),
-            headers={
-              "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}",
-              "Content-Type": "application/json"
-            }
+          
+          SYSTEM_PROMPT = (
+              "You are a senior software engineer conducting a strict code review. "
+              "Respond with a single valid JSON object only. "
+              "No markdown fences, no explanation, no text outside the JSON."
           )
-
+          
+          USER_PROMPT = (
+              "Analyze the following git diff and identify issues.\n\n"
+              "Respond in this exact JSON shape:\n"
+              "{\n"
+              "  \"summary\": \"One sentence overall assessment.\",\n"
+              "  \"verdict\": \"PASS or FAIL\",\n"
+              "  \"issues\": [\n"
+              "    {\n"
+              "      \"file\": \"path/to/file.py\",\n"
+              "      \"line\": 42,\n"
+              "      \"severity\": \"CRITICAL or WARNING or SUGGESTION\",\n"
+              "      \"title\": \"Short issue name\",\n"
+              "      \"description\": \"What is wrong and why it is a problem.\",\n"
+              "      \"fix\": \"Concrete suggested fix or code snippet.\"\n"
+              "    }\n"
+              "  ]\n"
+              "}\n\n"
+              "Rules:\n"
+              "- verdict is FAIL if ANY issue has severity CRITICAL.\n"
+              "- verdict is PASS only if there are zero CRITICAL issues.\n\n"
+              "Detect CRITICAL issues:\n"
+              "  * Bare except or except Exception without specific exception types\n"
+              "  * Direct dict access d[\"key\"] where .get(\"key\") should be used\n"
+              "  * Missing try/except around I/O, DB calls, or network requests\n"
+              "  * Unhandled None that will cause AttributeError at runtime\n"
+              "  * Credentials, tokens, or API keys hardcoded in source\n\n"
+              "Detect WARNING issues:\n"
+              "  * Python functions missing type hints on parameters or return type\n"
+              "  * Functions longer than 40 lines with no decomposition\n"
+              "  * Deeply nested conditionals (3+ levels) without early returns\n"
+              "  * Mutable default arguments e.g. def f(x=[])\n"
+              "  * Poor variable names (single letters outside loops)\n\n"
+              "Detect SUGGESTION issues:\n"
+              "  * Missing docstrings on public functions or classes\n"
+              "  * Repeated code blocks that could be extracted\n"
+              "  * Logging statements without log levels\n\n"
+              "Extra rules:\n"
+              "  * If no Python in diff, skip Python checks but still flag secrets and broad exceptions.\n"
+              "  * line must be the actual line number in the diff where the issue starts.\n"
+              "  * Do not invent issues. Only report what is visible in the diff.\n\n"
+              "GIT DIFF:\n" + diff
+          )
+          
+          payload = {
+              "model": "gpt-4o",
+              "temperature": 0,
+              "response_format": {"type": "json_object"},
+              "messages": [
+                  {"role": "system", "content": SYSTEM_PROMPT},
+                  {"role": "user",   "content": USER_PROMPT},
+              ],
+          }
+          
+          req = urllib.request.Request(
+              "https://api.openai.com/v1/chat/completions",
+              data=json.dumps(payload).encode(),
+              headers={
+                  "Authorization": "Bearer " + os.environ["OPENAI_API_KEY"],
+                  "Content-Type": "application/json",
+              },
+          )
+          
           with urllib.request.urlopen(req) as resp:
-            body = json.loads(resp.read())
-
+              body = json.loads(resp.read())
+          
           ai_text = body["choices"][0]["message"]["content"].strip()
-
-          # Strip accidental markdown fences just in case
           if ai_text.startswith("```"):
-            ai_text = ai_text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-
+              ai_text = ai_text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+          
           with open("/tmp/ai_review.json", "w") as f:
-            f.write(ai_text)
-
+              f.write(ai_text)
+          
           parsed = json.loads(ai_text)
-          print(f"Verdict: {parsed['verdict']}")
-          print(f"Issues:  {len(parsed.get('issues', []))}")
+          print("Verdict :", parsed["verdict"])
+          print("Issues  :", len(parsed.get("issues", [])))
           PYEOF
-
-      # ─────────────────────────────────────────────
-      # STEP 4 — Post inline comments via GitHub API
-      # ─────────────────────────────────────────────
-      - name: Post inline review comments
-        id: post_comments
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          python3 - <<'PYEOF'
+          
+                - name: Run AI review
+                  id: ai_review
+                  env:
+                    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+                  run: python3 /tmp/run_review.py
+          
+                # ── STEP 4: Write and run comment posting script ─────────────────────
+                - name: Write comment posting script
+                  run: |
+                    cat > /tmp/post_comments.py << 'PYEOF'
           import json, os, urllib.request
 
           review = json.loads(open("/tmp/ai_review.json").read())
@@ -198,87 +175,89 @@ GIT DIFF:
           repo   = os.environ["GITHUB_REPOSITORY"]
           pr_num = os.environ["PR_NUMBER"]
           sha    = os.environ["HEAD_SHA"]
-
+          
           SEVERITY_EMOJI = {"CRITICAL": "🚨", "WARNING": "⚠️", "SUGGESTION": "💡"}
-
+          
           comments = []
           for issue in review.get("issues", []):
               sev   = issue.get("severity", "WARNING")
               emoji = SEVERITY_EMOJI.get(sev, "💬")
               body  = (
-                  f"{emoji} **{sev}: {issue['title']}**\n\n"
-                  f"**Problem:** {issue['description']}\n\n"
-                  f"**Suggested fix:**\n```\n{issue['fix']}\n```"
+                  emoji + " **" + sev + ": " + issue["title"] + "**\n\n" +
+                  "**Problem:** " + issue["description"] + "\n\n" +
+                  "**Suggested fix:**\n```\n" + issue["fix"] + "\n```"
               )
               comments.append({
                   "path": issue["file"],
                   "line": issue["line"],
                   "side": "RIGHT",
-                  "body": body
+                  "body": body,
               })
-
+          
           payload = {
               "commit_id": sha,
-              "body": f"## 🤖 AI Review — {review['verdict']}\n\n{review['summary']}",
+              "body": "## AI Review Result: " + review["verdict"] + "\n\n" + review["summary"],
               "event": "COMMENT",
-              "comments": comments
+              "comments": comments,
           }
-
-          url = f"https://api.github.com/repos/{repo}/pulls/{pr_num}/reviews"
+          
+          url = "https://api.github.com/repos/" + repo + "/pulls/" + pr_num + "/reviews"
           req = urllib.request.Request(
               url,
               data=json.dumps(payload).encode(),
               headers={
-                  "Authorization": f"Bearer {token}",
+                  "Authorization": "Bearer " + token,
                   "Accept": "application/vnd.github+json",
                   "Content-Type": "application/json",
-                  "X-GitHub-Api-Version": "2022-11-28"
-              }
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
           )
+          
           with urllib.request.urlopen(req) as resp:
               result = json.loads(resp.read())
-              print(f"Review posted: #{result.get('id')}")
-
+              print("Review posted: #" + str(result.get("id")))
+          
           with open(os.environ["GITHUB_OUTPUT"], "a") as gho:
-              print(f"verdict={review['verdict']}", file=gho)
+              gho.write("verdict=" + review["verdict"] + "\n")
           PYEOF
+          
+      - name: Post inline review comments
+        id: post_comments
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 /tmp/post_comments.py
 
-      # ─────────────────────────────────────────────
-      # STEP 5 — Notify and enforce pass/fail
-      # ─────────────────────────────────────────────
-      - name: Notify — PASS
-        if: steps.post_comments.outputs.verdict == 'PASS' && steps.readme_check.outputs.readme_present == 'true'
+      # ── STEP 5: Notify and enforce pass/fail ─────────────────────────────
+      - name: Notify PASS
+        if: >-
+          steps.post_comments.outputs.verdict == 'PASS' &&
+          steps.readme_check.outputs.readme_present == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ steps.pr_data.outputs.pr_author }}
         run: |
-          gh pr comment $PR_NUMBER --body "## ✅ AI Review Passed
+          gh pr comment "$PR_NUMBER" --body "AI Review PASSED. GPT-4o found no critical issues. Reviewers: please complete human approval before merging."
 
-          @$PR_AUTHOR — GPT-4o found no critical issues in this PR.
-
-          > Reviewers: please complete human approval before merging."
-
-      - name: Notify and fail — CRITICAL issues or missing README
-        if: steps.post_comments.outputs.verdict == 'FAIL' || steps.readme_check.outputs.readme_present == 'false'
+      - name: Notify FAIL and exit
+        if: >-
+          steps.post_comments.outputs.verdict == 'FAIL' ||
+          steps.readme_check.outputs.readme_present == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ steps.pr_data.outputs.pr_author }}
+          VERDICT: ${{ steps.post_comments.outputs.verdict }}
+          README_OK: ${{ steps.readme_check.outputs.readme_present }}
         run: |
           REASON=""
-          if [ "${{ steps.post_comments.outputs.verdict }}" == "FAIL" ]; then
-            REASON="$REASON\n- 🚨 Critical code issues found (see inline comments above)"
+          if [ "$VERDICT" = "FAIL" ]; then
+            REASON="${REASON} Critical code issues found (see inline comments)."
           fi
-          if [ "${{ steps.readme_check.outputs.readme_present }}" == "false" ]; then
-            REASON="$REASON\n- 📄 README.md is missing from this PR"
+          if [ "$README_OK" = "false" ]; then
+            REASON="${REASON} README.md is missing from this PR."
           fi
-
-          gh pr comment $PR_NUMBER --body "## ❌ AI Review Failed
-
-          @$PR_AUTHOR — This PR cannot be merged until the following are resolved:
-          $REASON
-
-          Please address all 🚨 CRITICAL inline comments and push a new commit to re-trigger the review."
-
+          gh pr comment "$PR_NUMBER" --body "AI Review FAILED. This PR cannot be merged. Reason: $REASON Please fix all issues and push a new commit."
           exit 1
