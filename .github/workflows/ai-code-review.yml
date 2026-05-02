@@ -78,6 +78,7 @@ jobs:
 
       # ─────────────────────────────────────────────
       # STEP 3 — AI code review via OpenAI API (GPT-4o)
+      #          Uses OPENAI_API_KEY from repository secrets
       # ─────────────────────────────────────────────
       - name: Run AI review
         id: ai_review
@@ -85,81 +86,81 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           python3 - <<'PYEOF'
-          import json, os, urllib.request, sys
+          import json, os, urllib.request
 
           diff = open("/tmp/diff_trimmed.txt").read()
 
           SYSTEM_PROMPT = """You are a senior software engineer conducting a strict code review.
-          You MUST respond with a single valid JSON object only — no markdown fences,
-          no explanation, no text outside the JSON."""
+You MUST respond with a single valid JSON object only — no markdown fences,
+no explanation, no text outside the JSON."""
 
           USER_PROMPT = f"""Analyze the following git diff and identify issues.
 
-          Respond in this exact JSON shape:
-          {{
-            "summary": "One sentence overall assessment.",
-            "verdict": "PASS or FAIL",
-            "issues": [
-              {{
-                "file": "path/to/file.py",
-                "line": 42,
-                "severity": "CRITICAL or WARNING or SUGGESTION",
-                "title": "Short issue name",
-                "description": "What is wrong and why it is a problem.",
-                "fix": "Concrete suggested fix or code snippet."
-              }}
-            ]
-          }}
+Respond in this exact JSON shape:
+{{
+  "summary": "One sentence overall assessment.",
+  "verdict": "PASS or FAIL",
+  "issues": [
+    {{
+      "file": "path/to/file.py",
+      "line": 42,
+      "severity": "CRITICAL or WARNING or SUGGESTION",
+      "title": "Short issue name",
+      "description": "What is wrong and why it is a problem.",
+      "fix": "Concrete suggested fix or code snippet."
+    }}
+  ]
+}}
 
-          Rules:
-          - verdict is FAIL if ANY issue has severity CRITICAL.
-          - verdict is PASS only if there are zero CRITICAL issues.
+Rules:
+- verdict is FAIL if ANY issue has severity CRITICAL.
+- verdict is PASS only if there are zero CRITICAL issues.
 
-          Detect CRITICAL issues:
-            * Bare `except Exception` or bare `except:` without specific exception types
-            * Direct dict access d["key"] where .get("key") should be used
-            * Missing try/except around risky I/O, DB calls, or network requests
-            * Unhandled None that will cause AttributeError at runtime
-            * Credentials, tokens, or API keys hardcoded in source
+Detect CRITICAL issues:
+  * Bare `except Exception` or bare `except:` without specific exception types
+  * Direct dict access d["key"] where .get("key") should be used
+  * Missing try/except around risky I/O, DB calls, or network requests
+  * Unhandled None that will cause AttributeError at runtime
+  * Credentials, tokens, or API keys hardcoded in source
 
-          Detect WARNING issues:
-            * Python functions missing type hints on parameters or return type
-            * Functions longer than 40 lines with no decomposition
-            * Deeply nested conditionals (3+ levels) without early returns
-            * Mutable default arguments (def f(x=[]))
-            * Poor variable names (single letters outside loops)
+Detect WARNING issues:
+  * Python functions missing type hints on parameters or return type
+  * Functions longer than 40 lines with no decomposition
+  * Deeply nested conditionals (3+ levels) without early returns
+  * Mutable default arguments (def f(x=[]))
+  * Poor variable names (single letters outside loops)
 
-          Detect SUGGESTION issues:
-            * Missing docstrings on public functions or classes
-            * Repeated code blocks that could be extracted
-            * Logging statements without log levels
+Detect SUGGESTION issues:
+  * Missing docstrings on public functions or classes
+  * Repeated code blocks that could be extracted
+  * Logging statements without log levels
 
-          - If the diff has no Python, skip Python-specific checks but still check for
-            hardcoded secrets, broad exception patterns in other languages, and readability.
-          - line must be the actual line number from the diff where the issue starts.
-          - Do not invent issues. Only report what is visible in the diff.
+- If the diff has no Python, skip Python-specific checks but still check for
+  hardcoded secrets, broad exception patterns in other languages, and readability.
+- line must be the actual line number from the diff where the issue starts.
+- Do not invent issues. Only report what is visible in the diff.
 
-          GIT DIFF:
-          {diff}
-          """
+GIT DIFF:
+{diff}
+"""
 
-          payload = {{
+          payload = {
             "model": "gpt-4o",
             "temperature": 0,
-            "response_format": {{"type": "json_object"}},
+            "response_format": {"type": "json_object"},
             "messages": [
-              {{"role": "system", "content": SYSTEM_PROMPT}},
-              {{"role": "user",   "content": USER_PROMPT}}
+              {"role": "system", "content": SYSTEM_PROMPT},
+              {"role": "user",   "content": USER_PROMPT}
             ]
-          }}
+          }
 
           req = urllib.request.Request(
             "https://api.openai.com/v1/chat/completions",
             data=json.dumps(payload).encode(),
-            headers={{
-              "Authorization": f"Bearer {{os.environ['OPENAI_API_KEY']}}",
+            headers={
+              "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}",
               "Content-Type": "application/json"
-            }}
+            }
           )
 
           with urllib.request.urlopen(req) as resp:
@@ -175,8 +176,8 @@ jobs:
             f.write(ai_text)
 
           parsed = json.loads(ai_text)
-          print(f"Verdict: {{parsed['verdict']}}")
-          print(f"Issues:  {{len(parsed.get('issues', []))}}")
+          print(f"Verdict: {parsed['verdict']}")
+          print(f"Issues:  {len(parsed.get('issues', []))}")
           PYEOF
 
       # ─────────────────────────────────────────────
