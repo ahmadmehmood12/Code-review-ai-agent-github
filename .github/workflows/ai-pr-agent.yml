@@ -1,4 +1,4 @@
-name: AI PR Reviewer (OpenAI)
+name: AI PR Code Review Agent
 
 on:
   pull_request:
@@ -10,17 +10,16 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Get PR Diff
-        id: diff
+      - name: Get PR diff
         run: |
           git fetch origin main
-          git diff origin/main...HEAD > pr.diff
+          git diff origin/main...HEAD > diff.txt
 
-      - name: Call OpenAI API
-        id: ai_review
+      - name: Call OpenAI API for review
+        id: review
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
@@ -34,34 +33,34 @@ jobs:
             "messages": [
               {
                 "role": "system",
-                "content": "You are a strict code reviewer."
+                "content": "You are a strict senior software engineer reviewing pull requests. Detect bad practices, unsafe dict access, missing error handling, and missing README.md."
               },
               {
                 "role": "user",
-                "content": "Review this diff and find issues:\n\n$(cat pr.diff)"
+                "content": "Review this PR diff and return PASS or FAIL with issues and fixes:\n\n$(cat diff.txt)"
               }
             ]
           }
           EOF
           )
 
-          echo "$RESPONSE" > response.json
-          echo "response<<EOF" >> $GITHUB_OUTPUT
-          cat response.json >> $GITHUB_OUTPUT
+          echo "$RESPONSE" > result.json
+          echo "result<<EOF" >> $GITHUB_OUTPUT
+          cat result.json >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Comment on PR
+      - name: Post PR Comment
         uses: actions/github-script@v7
+        env:
+          RESULT: ${{ steps.review.outputs.result }}
         with:
           script: |
-            const response = JSON.parse(process.env.RESPONSE);
-            const comment = response.choices[0].message.content;
+            const res = JSON.parse(process.env.RESULT);
+            const text = res.choices[0].message.content;
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: "## 🤖 AI Review\n\n" + comment
+              body: "## 🤖 AI Code Review\n\n" + text
             });
-        env:
-          RESPONSE: ${{ steps.ai_review.outputs.response }}
