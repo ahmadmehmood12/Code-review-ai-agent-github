@@ -1,4 +1,4 @@
-name: AI PR Reviewer
+name: AI PR Reviewer (GPT)
 
 on:
   pull_request:
@@ -33,21 +33,17 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          # Get the full unified diff
           git diff $BASE_SHA...$HEAD_SHA > /tmp/pr_diff.txt
-          DIFF_CONTENT=$(cat /tmp/pr_diff.txt | head -c 28000)  # stay within token budget
+          DIFF_CONTENT=$(cat /tmp/pr_diff.txt | head -c 28000)
           echo "diff_length=$(wc -l < /tmp/pr_diff.txt)" >> $GITHUB_OUTPUT
 
-          # Get list of changed files
           CHANGED_FILES=$(git diff --name-only $BASE_SHA...$HEAD_SHA)
           echo "changed_files<<EOF" >> $GITHUB_OUTPUT
           echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-          # Save diff for next step
           printf '%s' "$DIFF_CONTENT" > /tmp/diff_trimmed.txt
 
-          # PR author
           PR_AUTHOR=$(gh pr view $PR_NUMBER --json author --jq '.author.login')
           echo "pr_author=$PR_AUTHOR" >> $GITHUB_OUTPUT
 
@@ -81,36 +77,35 @@ jobs:
           Please add or update \`README.md\` before this can be merged."
 
       # ─────────────────────────────────────────────
-      # STEP 3 — AI code review via Anthropic API
+      # STEP 3 — AI code review via OpenAI API (GPT-4o)
       # ─────────────────────────────────────────────
       - name: Run AI review
         id: ai_review
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          DIFF=$(cat /tmp/diff_trimmed.txt)
-
-          # Build the JSON payload with the review prompt
           python3 - <<'PYEOF'
           import json, os, urllib.request, sys
 
           diff = open("/tmp/diff_trimmed.txt").read()
 
-          PROMPT = f"""You are a senior software engineer conducting a strict code review.
-          Analyze the following git diff and identify issues. You MUST respond with a single
-          valid JSON object — no markdown fences, no explanation outside the JSON.
+          SYSTEM_PROMPT = """You are a senior software engineer conducting a strict code review.
+          You MUST respond with a single valid JSON object only — no markdown fences,
+          no explanation, no text outside the JSON."""
 
-          Respond in this exact shape:
+          USER_PROMPT = f"""Analyze the following git diff and identify issues.
+
+          Respond in this exact JSON shape:
           {{
             "summary": "One sentence overall assessment.",
-            "verdict": "PASS" | "FAIL",
+            "verdict": "PASS or FAIL",
             "issues": [
               {{
                 "file": "path/to/file.py",
                 "line": 42,
-                "severity": "CRITICAL" | "WARNING" | "SUGGESTION",
+                "severity": "CRITICAL or WARNING or SUGGESTION",
                 "title": "Short issue name",
-                "description": "What is wrong and why it's a problem.",
+                "description": "What is wrong and why it is a problem.",
                 "fix": "Concrete suggested fix or code snippet."
               }}
             ]
@@ -119,22 +114,26 @@ jobs:
           Rules:
           - verdict is FAIL if ANY issue has severity CRITICAL.
           - verdict is PASS only if there are zero CRITICAL issues.
-          - Detect CRITICAL issues:
-              * Bare `except Exception` or bare `except:` without specific exception types
-              * Direct dict access `d["key"]` where `.get("key")` should be used
-              * Missing try/except around risky I/O, DB calls, or network requests
-              * Unhandled None that will cause AttributeError at runtime
-              * Credentials, tokens, or API keys hardcoded in source
-          - Detect WARNING issues:
-              * Python functions missing type hints on parameters or return type
-              * Functions longer than 40 lines with no decomposition
-              * Deeply nested conditionals (3+ levels) without early returns
-              * Mutable default arguments (def f(x=[]))
-              * Poor variable names (single letters outside loops)
-          - Detect SUGGESTION issues:
-              * Missing docstrings on public functions or classes
-              * Repeated code blocks that could be extracted
-              * Logging statements without log levels
+
+          Detect CRITICAL issues:
+            * Bare `except Exception` or bare `except:` without specific exception types
+            * Direct dict access d["key"] where .get("key") should be used
+            * Missing try/except around risky I/O, DB calls, or network requests
+            * Unhandled None that will cause AttributeError at runtime
+            * Credentials, tokens, or API keys hardcoded in source
+
+          Detect WARNING issues:
+            * Python functions missing type hints on parameters or return type
+            * Functions longer than 40 lines with no decomposition
+            * Deeply nested conditionals (3+ levels) without early returns
+            * Mutable default arguments (def f(x=[]))
+            * Poor variable names (single letters outside loops)
+
+          Detect SUGGESTION issues:
+            * Missing docstrings on public functions or classes
+            * Repeated code blocks that could be extracted
+            * Logging statements without log levels
+
           - If the diff has no Python, skip Python-specific checks but still check for
             hardcoded secrets, broad exception patterns in other languages, and readability.
           - line must be the actual line number from the diff where the issue starts.
@@ -144,27 +143,31 @@ jobs:
           {diff}
           """
 
-          payload = {
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": 4096,
-            "messages": [{"role": "user", "content": PROMPT}]
-          }
+          payload = {{
+            "model": "gpt-4o",
+            "temperature": 0,
+            "response_format": {{"type": "json_object"}},
+            "messages": [
+              {{"role": "system", "content": SYSTEM_PROMPT}},
+              {{"role": "user",   "content": USER_PROMPT}}
+            ]
+          }}
 
           req = urllib.request.Request(
-            "https://api.anthropic.com/v1/messages",
+            "https://api.openai.com/v1/chat/completions",
             data=json.dumps(payload).encode(),
-            headers={
-              "x-api-key": os.environ["ANTHROPIC_API_KEY"],
-              "anthropic-version": "2023-06-01",
-              "content-type": "application/json"
-            }
+            headers={{
+              "Authorization": f"Bearer {{os.environ['OPENAI_API_KEY']}}",
+              "Content-Type": "application/json"
+            }}
           )
 
           with urllib.request.urlopen(req) as resp:
             body = json.loads(resp.read())
 
-          ai_text = body["content"][0]["text"].strip()
-          # Strip accidental markdown fences
+          ai_text = body["choices"][0]["message"]["content"].strip()
+
+          # Strip accidental markdown fences just in case
           if ai_text.startswith("```"):
             ai_text = ai_text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
 
@@ -172,8 +175,8 @@ jobs:
             f.write(ai_text)
 
           parsed = json.loads(ai_text)
-          print(f"Verdict: {parsed['verdict']}")
-          print(f"Issues: {len(parsed.get('issues', []))}")
+          print(f"Verdict: {{parsed['verdict']}}")
+          print(f"Issues:  {{len(parsed.get('issues', []))}}")
           PYEOF
 
       # ─────────────────────────────────────────────
@@ -187,7 +190,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           python3 - <<'PYEOF'
-          import json, os, urllib.request, urllib.error
+          import json, os, urllib.request
 
           review = json.loads(open("/tmp/ai_review.json").read())
           token  = os.environ["GH_TOKEN"]
@@ -213,7 +216,6 @@ jobs:
                   "body": body
               })
 
-          # Create a single review with all inline comments
           payload = {
               "commit_id": sha,
               "body": f"## 🤖 AI Review — {review['verdict']}\n\n{review['summary']}",
@@ -236,7 +238,8 @@ jobs:
               result = json.loads(resp.read())
               print(f"Review posted: #{result.get('id')}")
 
-          print(f"verdict={review['verdict']}", file=open(os.environ['GITHUB_OUTPUT'], 'a'))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as gho:
+              print(f"verdict={review['verdict']}", file=gho)
           PYEOF
 
       # ─────────────────────────────────────────────
@@ -251,7 +254,7 @@ jobs:
         run: |
           gh pr comment $PR_NUMBER --body "## ✅ AI Review Passed
 
-          @$PR_AUTHOR — No critical issues were found.
+          @$PR_AUTHOR — GPT-4o found no critical issues in this PR.
 
           > Reviewers: please complete human approval before merging."
 
@@ -275,6 +278,6 @@ jobs:
           @$PR_AUTHOR — This PR cannot be merged until the following are resolved:
           $REASON
 
-          Please address all 🚨 CRITICAL inline comments, then push a new commit to re-trigger the review."
+          Please address all 🚨 CRITICAL inline comments and push a new commit to re-trigger the review."
 
           exit 1
