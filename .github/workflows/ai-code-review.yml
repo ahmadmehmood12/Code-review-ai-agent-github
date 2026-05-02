@@ -1,91 +1,280 @@
-name: AI Code Review (Production)
+name: AI PR Reviewer
 
 on:
   pull_request:
-    branches: [main]
+    branches:
+      - main
+
+permissions:
+  pull-requests: write
+  contents: read
+  checks: write
 
 jobs:
-  review:
+  ai-review:
+    name: AI Code Review
     runs-on: ubuntu-latest
-
-    permissions:
-      contents: write
-      pull-requests: write
+    if: github.base_ref == 'main'
 
     steps:
-      - name: Checkout
+      # ─────────────────────────────────────────────
+      # STEP 1 — Checkout & fetch PR diff
+      # ─────────────────────────────────────────────
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      # ✅ Install dependencies properly
-      - name: Install dependencies
+      - name: Fetch PR diff and metadata
+        id: pr_data
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          # Get the full unified diff
+          git diff $BASE_SHA...$HEAD_SHA > /tmp/pr_diff.txt
+          DIFF_CONTENT=$(cat /tmp/pr_diff.txt | head -c 28000)  # stay within token budget
+          echo "diff_length=$(wc -l < /tmp/pr_diff.txt)" >> $GITHUB_OUTPUT
 
-      # ✅ Static code check BEFORE AI review
-      - name: Run Flake8 Linting
+          # Get list of changed files
+          CHANGED_FILES=$(git diff --name-only $BASE_SHA...$HEAD_SHA)
+          echo "changed_files<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          # Save diff for next step
+          printf '%s' "$DIFF_CONTENT" > /tmp/diff_trimmed.txt
+
+          # PR author
+          PR_AUTHOR=$(gh pr view $PR_NUMBER --json author --jq '.author.login')
+          echo "pr_author=$PR_AUTHOR" >> $GITHUB_OUTPUT
+
+      # ─────────────────────────────────────────────
+      # STEP 2 — README guard
+      # ─────────────────────────────────────────────
+      - name: Check for README.md in PR
+        id: readme_check
+        env:
+          CHANGED_FILES: ${{ steps.pr_data.outputs.changed_files }}
         run: |
-          flake8 . || true
+          if echo "$CHANGED_FILES" | grep -qi "README.md"; then
+            echo "readme_present=true" >> $GITHUB_OUTPUT
+          else
+            echo "readme_present=false" >> $GITHUB_OUTPUT
+          fi
 
-      - name: Run AI Review
+      - name: Post README missing comment
+        if: steps.readme_check.outputs.readme_present == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ steps.pr_data.outputs.pr_author }}
+        run: |
+          gh pr comment $PR_NUMBER --body "## ❌ Missing README
+
+          @$PR_AUTHOR — This PR does not include a \`README.md\` update.
+
+          **Why this matters:** Every PR touching source code should document the change, new setup steps, or updated usage.
+
+          Please add or update \`README.md\` before this can be merged."
+
+      # ─────────────────────────────────────────────
+      # STEP 3 — AI code review via Anthropic API
+      # ─────────────────────────────────────────────
+      - name: Run AI review
         id: ai_review
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          python scripts/ai_review.py
+          DIFF=$(cat /tmp/diff_trimmed.txt)
 
-      - name: Post Inline Comments
-        if: always()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const review = JSON.parse(fs.readFileSync('review_result.json', 'utf8'));
+          # Build the JSON payload with the review prompt
+          python3 - <<'PYEOF'
+          import json, os, urllib.request, sys
 
-            for (const issue of review.issues) {
-              try {
-                await github.rest.pulls.createReviewComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  pull_number: context.issue.number,
-                  body: issue.comment,
-                  path: issue.file,
-                  line: issue.line,
-                  side: "RIGHT"
-                });
-              } catch (err) {
-                console.log("Inline comment failed:", err);
-              }
+          diff = open("/tmp/diff_trimmed.txt").read()
+
+          PROMPT = f"""You are a senior software engineer conducting a strict code review.
+          Analyze the following git diff and identify issues. You MUST respond with a single
+          valid JSON object — no markdown fences, no explanation outside the JSON.
+
+          Respond in this exact shape:
+          {{
+            "summary": "One sentence overall assessment.",
+            "verdict": "PASS" | "FAIL",
+            "issues": [
+              {{
+                "file": "path/to/file.py",
+                "line": 42,
+                "severity": "CRITICAL" | "WARNING" | "SUGGESTION",
+                "title": "Short issue name",
+                "description": "What is wrong and why it's a problem.",
+                "fix": "Concrete suggested fix or code snippet."
+              }}
+            ]
+          }}
+
+          Rules:
+          - verdict is FAIL if ANY issue has severity CRITICAL.
+          - verdict is PASS only if there are zero CRITICAL issues.
+          - Detect CRITICAL issues:
+              * Bare `except Exception` or bare `except:` without specific exception types
+              * Direct dict access `d["key"]` where `.get("key")` should be used
+              * Missing try/except around risky I/O, DB calls, or network requests
+              * Unhandled None that will cause AttributeError at runtime
+              * Credentials, tokens, or API keys hardcoded in source
+          - Detect WARNING issues:
+              * Python functions missing type hints on parameters or return type
+              * Functions longer than 40 lines with no decomposition
+              * Deeply nested conditionals (3+ levels) without early returns
+              * Mutable default arguments (def f(x=[]))
+              * Poor variable names (single letters outside loops)
+          - Detect SUGGESTION issues:
+              * Missing docstrings on public functions or classes
+              * Repeated code blocks that could be extracted
+              * Logging statements without log levels
+          - If the diff has no Python, skip Python-specific checks but still check for
+            hardcoded secrets, broad exception patterns in other languages, and readability.
+          - line must be the actual line number from the diff where the issue starts.
+          - Do not invent issues. Only report what is visible in the diff.
+
+          GIT DIFF:
+          {diff}
+          """
+
+          payload = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": PROMPT}]
+          }
+
+          req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=json.dumps(payload).encode(),
+            headers={
+              "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+              "anthropic-version": "2023-06-01",
+              "content-type": "application/json"
             }
+          )
 
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: `### 🤖 AI Review Summary\n\n${review.summary}\n\n**Status:** ${review.status}`
-            });
+          with urllib.request.urlopen(req) as resp:
+            body = json.loads(resp.read())
 
-      # ❌ Only approve if passed
-      - name: Auto Approve PR
-        if: success()
-        uses: hmarr/auto-approve-action@v4
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          ai_text = body["content"][0]["text"].strip()
+          # Strip accidental markdown fences
+          if ai_text.startswith("```"):
+            ai_text = ai_text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
 
-      - name: Save Approval Artifact
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: approval-log
-          path: review_result.json
+          with open("/tmp/ai_review.json", "w") as f:
+            f.write(ai_text)
 
-      - name: Fail if Rejected
-        if: failure()
-        run: exit 1
+          parsed = json.loads(ai_text)
+          print(f"Verdict: {parsed['verdict']}")
+          print(f"Issues: {len(parsed.get('issues', []))}")
+          PYEOF
+
+      # ─────────────────────────────────────────────
+      # STEP 4 — Post inline comments via GitHub API
+      # ─────────────────────────────────────────────
+      - name: Post inline review comments
+        id: post_comments
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, urllib.request, urllib.error
+
+          review = json.loads(open("/tmp/ai_review.json").read())
+          token  = os.environ["GH_TOKEN"]
+          repo   = os.environ["GITHUB_REPOSITORY"]
+          pr_num = os.environ["PR_NUMBER"]
+          sha    = os.environ["HEAD_SHA"]
+
+          SEVERITY_EMOJI = {"CRITICAL": "🚨", "WARNING": "⚠️", "SUGGESTION": "💡"}
+
+          comments = []
+          for issue in review.get("issues", []):
+              sev   = issue.get("severity", "WARNING")
+              emoji = SEVERITY_EMOJI.get(sev, "💬")
+              body  = (
+                  f"{emoji} **{sev}: {issue['title']}**\n\n"
+                  f"**Problem:** {issue['description']}\n\n"
+                  f"**Suggested fix:**\n```\n{issue['fix']}\n```"
+              )
+              comments.append({
+                  "path": issue["file"],
+                  "line": issue["line"],
+                  "side": "RIGHT",
+                  "body": body
+              })
+
+          # Create a single review with all inline comments
+          payload = {
+              "commit_id": sha,
+              "body": f"## 🤖 AI Review — {review['verdict']}\n\n{review['summary']}",
+              "event": "COMMENT",
+              "comments": comments
+          }
+
+          url = f"https://api.github.com/repos/{repo}/pulls/{pr_num}/reviews"
+          req = urllib.request.Request(
+              url,
+              data=json.dumps(payload).encode(),
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "Content-Type": "application/json",
+                  "X-GitHub-Api-Version": "2022-11-28"
+              }
+          )
+          with urllib.request.urlopen(req) as resp:
+              result = json.loads(resp.read())
+              print(f"Review posted: #{result.get('id')}")
+
+          print(f"verdict={review['verdict']}", file=open(os.environ['GITHUB_OUTPUT'], 'a'))
+          PYEOF
+
+      # ─────────────────────────────────────────────
+      # STEP 5 — Notify and enforce pass/fail
+      # ─────────────────────────────────────────────
+      - name: Notify — PASS
+        if: steps.post_comments.outputs.verdict == 'PASS' && steps.readme_check.outputs.readme_present == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ steps.pr_data.outputs.pr_author }}
+        run: |
+          gh pr comment $PR_NUMBER --body "## ✅ AI Review Passed
+
+          @$PR_AUTHOR — No critical issues were found.
+
+          > Reviewers: please complete human approval before merging."
+
+      - name: Notify and fail — CRITICAL issues or missing README
+        if: steps.post_comments.outputs.verdict == 'FAIL' || steps.readme_check.outputs.readme_present == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ steps.pr_data.outputs.pr_author }}
+        run: |
+          REASON=""
+          if [ "${{ steps.post_comments.outputs.verdict }}" == "FAIL" ]; then
+            REASON="$REASON\n- 🚨 Critical code issues found (see inline comments above)"
+          fi
+          if [ "${{ steps.readme_check.outputs.readme_present }}" == "false" ]; then
+            REASON="$REASON\n- 📄 README.md is missing from this PR"
+          fi
+
+          gh pr comment $PR_NUMBER --body "## ❌ AI Review Failed
+
+          @$PR_AUTHOR — This PR cannot be merged until the following are resolved:
+          $REASON
+
+          Please address all 🚨 CRITICAL inline comments, then push a new commit to re-trigger the review."
+
+          exit 1
